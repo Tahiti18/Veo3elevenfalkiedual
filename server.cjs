@@ -358,6 +358,53 @@ app.post("/mux", async (req,res)=>{
 });
 
 /* ------------------------- STATIC + PROVIDER WRAPS ---------------------- */
+// ---- KIE probe (server-side) ----
+app.post("/probe/kie", async (req, res) => {
+  try {
+    const candidates = Array.isArray(req.body?.candidates) ? req.body.candidates : [];
+    const submitBody = req.body?.body || { prompt:"probe", duration:1, aspect_ratio:"16:9", resolution:"720p", with_audio:false };
+
+    if (!candidates.length) return res.status(400).json({ error: "candidates[] required" });
+    if (!KIE_API_PREFIX) return res.status(500).json({ error: "KIE_API_PREFIX missing" });
+
+    const results = [];
+    for (const p of candidates) {
+      const pathStr = String(p || "").trim();
+      if (!pathStr) continue;
+      const url = `${KIE_API_PREFIX}${pathStr.startsWith("/")?"":"/"}${pathStr}`;
+      let status = 0, ok=false, job_id=null, video_url=null, summary=null, raw=null, error=null;
+      try {
+        const r = await fetch(url, { method:"POST", headers: kieHeaders(), body: JSON.stringify(submitBody) });
+        status = r.status;
+        const t = await r.text().catch(()=> "");
+        try { raw = JSON.parse(t); } catch { raw = t || ""; }
+
+        // dig for id/url
+        const find = (o)=>{
+          if (!o || typeof o!=="object") return;
+          if (!job_id) job_id = o.job_id || o.taskId || o.task_id || o.id || (o.data&& (o.data.job_id||o.data.id));
+          if (!video_url) {
+            if (typeof o.video_url==="string") video_url=o.video_url;
+            else if (o.output && typeof o.output.video_url==="string") video_url=o.output.video_url;
+            else if (o.video && typeof o.video.url==="string") video_url=o.video.url;
+            else if (typeof o.url==="string" && /^https?:\/\//.test(o.url)) video_url=o.url;
+          }
+          for (const k in o) if (o[k] && typeof o[k]==="object") find(o[k]);
+        };
+        if (typeof raw==="object") find(raw);
+
+        ok = r.ok || status===202;
+        summary = (ok? "OK":"FAIL") + (job_id? ` • job_id=${String(job_id).slice(0,10)}…`:"") + (video_url? ` • url=${video_url}`:"");
+      } catch(e) {
+        error = e?.message || String(e);
+      }
+      results.push({ path: pathStr, status, ok, job_id, video_url, summary, raw, error });
+    }
+    res.json({ ok:true, results });
+  } catch(e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
 app.use("/static", express.static(STATIC_ROOT, {
   setHeaders: (res) => res.setHeader("Cache-Control","public, max-age=31536000, immutable")
 }));
