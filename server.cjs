@@ -1,7 +1,9 @@
 // server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux
 // Node 18+, CommonJS.
 // Routes used by the UI: /health, /diag, /generate-fast, /generate-quality, /result/:jobId, /eleven/voices, /eleven/tts, /eleven/tts.stream, /mux
-
+console.log("[BOOT] starting veo3-backend-dual …");
+process.on("uncaughtException", e => console.error("[FATAL]", e));
+process.on("unhandledRejection", e => console.error("[FATAL-PROMISE]", e));
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs/promises");
