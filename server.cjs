@@ -28,17 +28,19 @@ const DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "kie").toLowerCase(); 
 
 // ----- KIE -----
 const KIE_KEY = process.env.KIE_KEY || "";
+
 // IMPORTANT: KIE public base is /api/v1/veo (not /veo3)
 let KIE_API_PREFIX = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1/veo").replace(/\/$/, "");
-// normalize any accidental ".../veo3" to ".../veo"
-KIE_API_PREFIX = KIE_API_PREFIX.replace(/\/veo3(\/|$)/, "/veo$1");
+KIE_API_PREFIX = KIE_API_PREFIX.replace(/\/veo3(\/|$)/, "/veo$1"); // normalize any accidental …/veo3 → …/veo
 
 // Submit is /generate for both fast/quality, model flag decides
 const KIE_FAST_PATH = process.env.KIE_FAST_PATH || process.env.VEO_FAST_PATH || "/generate";
 const KIE_QUALITY_PATH = process.env.KIE_QUALITY_PATH || "/generate";
+
 // Polling endpoint returns record info by taskId
 const KIE_RESULT_PATHS = (process.env.KIE_RESULT_PATHS || "/record-info?taskId=:id").split(",");
-// Optional 1080p fetch
+
+// Optional 1080p fetch (some tenants expose this)
 const KIE_HD_PATH = process.env.KIE_HD_PATH || "/get-1080p-video?taskId=:id";
 
 // ----- FAL -----
@@ -139,6 +141,21 @@ function findVideoUrl(maybe) {
   return null;
 }
 
+// Safely dig for any id-like field
+function deepFindId(obj) {
+  const keys = ["taskId","task_id","id","job_id","request_id"];
+  const q = [obj];
+  while (q.length) {
+    const v = q.pop();
+    if (!v || typeof v !== "object") continue;
+    for (const k of Object.keys(v)) {
+      if (keys.includes(k) && typeof v[k] === "string" && v[k]) return v[k];
+      if (v[k] && typeof v[k] === "object") q.push(v[k]);
+    }
+  }
+  return null;
+}
+
 // ---------- Providers ----------
 async function submitAndMaybeWaitFAL(body, modelName) {
   const payload = { ...body, model: modelName };
@@ -148,9 +165,12 @@ async function submitAndMaybeWaitFAL(body, modelName) {
   const t = await r.text();
   let j = {};
   try { j = JSON.parse(t); } catch { j = { raw: t }; }
-  if (!r.ok) return { ok: false, status: r.status, error: j?.error || t || `FAL submit ${r.status}`, raw: j };
+  if (!r.ok) {
+    console.error("[FAL] submit failed", r.status, t);
+    return { ok: false, status: r.status, error: j?.error || t || `FAL submit ${r.status}`, raw: j };
+  }
 
-  const jid = j.request_id || j.id || j.job_id || (j.data && (j.data.request_id || j.data.id)) || null;
+  const jid = deepFindId(j);
   const urlNow = findVideoUrl(j);
   if (urlNow) return { ok: true, status: 200, job_id: jid, video_url: urlNow, raw: j };
   if (!jid) return { ok: true, status: 202, pending: true, job_id: null, raw: j };
@@ -180,13 +200,23 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   const t = await r.text();
   let j = {};
   try { j = JSON.parse(t); } catch { j = { raw: t }; }
-  if (!r.ok) return { ok: false, status: r.status, error: j?.error || t || `KIE submit ${r.status}`, raw: j };
 
-  const jid =
+  if (!r.ok) {
+    console.error("[KIE] submit failed", r.status, t);
+    return { ok: false, status: r.status, error: j?.error || t || `KIE submit ${r.status}`, raw: j };
+  }
+
+  // --------- Robust job_id extraction + logging ---------
+  let jid =
     j.taskId || j.task_id || j.id || j.job_id ||
     (j.data && (j.data.taskId || j.data.task_id || j.data.id)) ||
     (j.result && (j.result.taskId || j.result.id)) ||
-    null;
+    (j.job && (j.job.taskId || j.job.id)) ||
+    deepFindId(j) || null;
+
+  if (!jid) {
+    console.error("[KIE] No job_id found in submit response, payload follows:\n", JSON.stringify(j, null, 2));
+  }
 
   const urlNow = findVideoUrl(j);
   if (urlNow) return { ok: true, status: 200, job_id: jid, video_url: urlNow, raw: j };
@@ -207,6 +237,7 @@ async function submitAndMaybeWaitKIE(body, modelName) {
         if (rr.ok) {
           const u = findVideoUrl(jj);
           if (u) {
+            // Try HD once; if not available, return u
             try {
               const hdUrl = `${KIE_API_PREFIX}${KIE_HD_PATH.startsWith("/") ? "" : "/"}${KIE_HD_PATH.replace(":id", encodeURIComponent(jid))}`;
               const hdRes = await fetch(hdUrl, { headers: kieHeaders() });
