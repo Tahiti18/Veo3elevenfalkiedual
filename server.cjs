@@ -528,7 +528,27 @@ app.use("/static", express.static(STATIC_ROOT, {
 
 // Root catch
 app.get("/", (_req, res) => res.status(404).send("OK"));
-
+// Debug route: directly hit KIE with a tiny test job and dump full JSON
+app.get("/debug/generate", async (req, res) => {
+  try {
+    const payload = {
+      prompt: "debug frame",
+      duration: 1,
+      aspect_ratio: "16:9",
+      resolution: "720p",
+      with_audio: false,
+      model: VEO_MODEL_FAST
+    };
+    const submitURL = `${KIE_API_PREFIX}${KIE_FAST_PATH.startsWith("/") ? "" : "/"}${KIE_FAST_PATH}`;
+    const r = await fetch(submitURL, { method: "POST", headers: kieHeaders(), body: JSON.stringify(payload) });
+    const text = await r.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+    res.status(r.status).json({ status: r.status, raw: json });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
 app.listen(PORT, () => {
   console.log(`[OK] backend listening on :${PORT}`);
   console.log(`[DEFAULT] provider: ${DEFAULT_PROVIDER}`);
