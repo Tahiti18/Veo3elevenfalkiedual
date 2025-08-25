@@ -359,18 +359,19 @@ app.get("/dl/:jobId", async (req, res) => {
     }
 
     // Optional allowlist to avoid open redirects
-    try {
-      const u = new URL(file);
-      const allowed = [
-        "r2.cloudflarestorage.com",
-        "s3.amazonaws.com",
-        "storage.googleapis.com",
-        "cdn.runwayml.com",
-        "runwayml.com",
-        "files.kie.ai",
-        "cdn.kie.ai"
-      ];
-      if (!allowed.includes(u.host)) {
+try {
+  const u = new URL(file);
+  const allowed = [
+    "r2.cloudflarestorage.com",
+    "s3.amazonaws.com",
+    "storage.googleapis.com",
+    "cdn.runwayml.com",
+    "runwayml.com",
+    "files.kie.ai",
+    "cdn.kie.ai",
+    "tempfile.aiquickdraw.com"   // <-- added
+  ];
+  if (!allowed.includes(u.host)) {
         return res.status(400).json({ error: "disallowed_host", host: u.host });
       }
     } catch {
