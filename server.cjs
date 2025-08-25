@@ -9,11 +9,11 @@ const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
-const app = express();
 
+const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---- CORS (explicit preflight OK/204) ----
+// ---- CORS (explicit preflight 204) ----
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -28,8 +28,11 @@ const DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "kie").toLowerCase(); 
 
 // ----- KIE -----
 const KIE_KEY = process.env.KIE_KEY || "";
-// IMPORTANT: base is /api/v1/veo (not /veo3)
-const KIE_API_PREFIX = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1/veo").replace(/\/$/, "");
+// IMPORTANT: KIE public base is /api/v1/veo (not /veo3)
+let KIE_API_PREFIX = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1/veo").replace(/\/$/, "");
+// normalize any accidental ".../veo3" to ".../veo"
+KIE_API_PREFIX = KIE_API_PREFIX.replace(/\/veo3(\/|$)/, "/veo$1");
+
 // Submit is /generate for both fast/quality, model flag decides
 const KIE_FAST_PATH = process.env.KIE_FAST_PATH || process.env.VEO_FAST_PATH || "/generate";
 const KIE_QUALITY_PATH = process.env.KIE_QUALITY_PATH || "/generate";
@@ -50,7 +53,7 @@ const FAL_BASE = (process.env.FAL_API_BASE || "https://api.fal.ai").replace(/\/$
 const FAL_SUBMIT_PATH = process.env.FAL_SUBMIT_PATH || "/v1/pipelines/google/veo/submit";
 const FAL_RESULT_BASE = (process.env.FAL_RESULT_BASE || "/v1/pipelines/google/veo/requests").replace(/\/$/, "");
 
-// Models (you can override)
+// Models
 const VEO_MODEL_FAST = process.env.VEO_MODEL_FAST || "V3_5";
 const VEO_MODEL_QUALITY = process.env.VEO_MODEL_QUALITY || "V4_5PLUS";
 
@@ -103,11 +106,9 @@ function findVideoUrl(maybe) {
     while (stack.length) {
       const v = stack.pop();
 
-      // direct string URL
       if (typeof v === "string" && /https?:\/\/.+\.(mp4|mov|m4v|m3u8)(\?|$)/i.test(v)) return v;
 
       if (v && typeof v === "object") {
-        // common fields
         if (typeof v.video_url === "string") return v.video_url;
         if (v.output && typeof v.output.video_url === "string") return v.output.video_url;
         if (v.video && typeof v.video.url === "string") return v.video.url;
@@ -115,17 +116,15 @@ function findVideoUrl(maybe) {
         if (v.data && (typeof v.data.url === "string" || typeof v.data.video_url === "string"))
           return v.data.video_url || v.data.url;
 
-        // ----- KIE specific: data.resultUrls is often a stringified JSON array -----
+        // KIE specific: data.resultUrls is often a stringified JSON array (or direct URL)
         if (v.data) {
           const ru = v.data.resultUrls || v.data.resultUrl || v.data.videoUrl;
           if (typeof ru === "string") {
             try {
               const arr = JSON.parse(ru);
               if (Array.isArray(arr) && arr.length && typeof arr[0] === "string") return arr[0];
-              // if ru itself was a direct URL
               if (/https?:\/\//.test(ru)) return ru;
             } catch {
-              // ru might just be a direct URL string
               if (/https?:\/\//.test(ru)) return ru;
             }
           } else if (Array.isArray(ru) && ru.length && typeof ru[0] === "string") {
@@ -193,7 +192,7 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   if (urlNow) return { ok: true, status: 200, job_id: jid, video_url: urlNow, raw: j };
   if (!jid) return { ok: true, status: 202, pending: true, job_id: null, raw: j };
 
-  // Poll record-info until we get URLs; then (optionally) try 1080p
+  // Poll record-info until URLs; then optionally try 1080p
   for (let i = 0; i < 5; i++) {
     await sleep(i === 0 ? 3000 : 5000);
     for (const pat of KIE_RESULT_PATHS) {
@@ -208,7 +207,6 @@ async function submitAndMaybeWaitKIE(body, modelName) {
         if (rr.ok) {
           const u = findVideoUrl(jj);
           if (u) {
-            // Try HD once; if not available, return u
             try {
               const hdUrl = `${KIE_API_PREFIX}${KIE_HD_PATH.startsWith("/") ? "" : "/"}${KIE_HD_PATH.replace(":id", encodeURIComponent(jid))}`;
               const hdRes = await fetch(hdUrl, { headers: kieHeaders() });
@@ -227,237 +225,277 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   return { ok: true, status: 202, pending: true, job_id: jid, raw: j };
 }
 
-// ---------- Routes ----------
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString(), defaultProvider: DEFAULT_PROVIDER });
-});
+// ---------- ROUTE REGISTRATION (root + /provider/:prov mirror) ----------
+function registerRoutes(router, withProviderParam = false) {
+  const stamp = () => new Date().toISOString();
 
-app.get("/diag", (_req, res) => {
-  res.json({
-    ok: true,
-    time: new Date().toISOString(),
-    defaultProvider: DEFAULT_PROVIDER,
-    kie: {
-      prefix: KIE_API_PREFIX,
-      fastPath: KIE_FAST_PATH,
-      qualityPath: KIE_QUALITY_PATH,
-      resultPaths: KIE_RESULT_PATHS,
-      hasAuth: !!KIE_KEY,
-    },
-    fal: {
-      base: FAL_BASE,
-      submitPath: FAL_SUBMIT_PATH,
-      resultBase: FAL_RESULT_BASE,
-      hasAuth: !!FAL_BASIC,
-    },
-    fastModel: VEO_MODEL_FAST,
-    qualityModel: VEO_MODEL_QUALITY,
-    elevenKeyPresent: !!ELEVEN_KEY,
-    muxEnabled: ENABLE_MUX,
+  // Health & diag
+  router.get("/health", (req, res) => {
+    const prov = withProviderParam ? (req.params.prov || DEFAULT_PROVIDER) : DEFAULT_PROVIDER;
+    res.json({ ok: true, ts: stamp(), provider: prov, defaultProvider: DEFAULT_PROVIDER });
   });
-});
 
-// Accept both /generate-fast and /generate (fast)
-app.post(["/generate", "/generate-fast"], async (req, res) => {
-  try {
-    const prov = providerFrom(req);
-    const body = req.body || {};
-    const fn = prov === "fal" ? submitAndMaybeWaitFAL : submitAndMaybeWaitKIE;
-    const out = await fn(body, VEO_MODEL_FAST);
-    res.status(out.status || 200).json({
-      success: !!out.ok,
-      provider: prov,
-      job_id: out.job_id || null,
-      pending: !!out.pending,
-      video_url: out.video_url || null,
-      meta: out.raw,
-      error: out.ok ? undefined : out.error,
+  router.get("/diag", (_req, res) => {
+    res.json({
+      ok: true,
+      time: stamp(),
+      defaultProvider: DEFAULT_PROVIDER,
+      kie: {
+        prefix: KIE_API_PREFIX,
+        fastPath: KIE_FAST_PATH,
+        qualityPath: KIE_QUALITY_PATH,
+        resultPaths: KIE_RESULT_PATHS,
+        hasAuth: !!KIE_KEY,
+      },
+      fal: {
+        base: FAL_BASE,
+        submitPath: FAL_SUBMIT_PATH,
+        resultBase: FAL_RESULT_BASE,
+        hasAuth: !!FAL_BASIC,
+      },
+      fastModel: VEO_MODEL_FAST,
+      qualityModel: VEO_MODEL_QUALITY,
+      elevenKeyPresent: !!ELEVEN_KEY,
+      muxEnabled: ENABLE_MUX,
     });
-  } catch (e) {
-    res.status(502).json({ success: false, error: e?.message || String(e) });
-  }
-});
+  });
 
-app.post("/generate-quality", async (req, res) => {
-  try {
-    const prov = providerFrom(req);
-    const body = req.body || {};
-    const fn = prov === "fal" ? submitAndMaybeWaitFAL : submitAndMaybeWaitKIE;
-    const out = await fn(body, VEO_MODEL_QUALITY);
-    res.status(out.status || 200).json({
-      success: !!out.ok,
-      provider: prov,
-      job_id: out.job_id || null,
-      pending: !!out.pending,
-      video_url: out.video_url || null,
-      meta: out.raw,
-      error: out.ok ? undefined : out.error,
-    });
-  } catch (e) {
-    res.status(502).json({ success: false, error: e?.message || String(e) });
-  }
-});
-
-// Polling
-app.get("/result/:jobId", async (req, res) => {
-  try {
-    const prov = providerFrom(req);
-    const id = req.params.jobId;
-
-    if (prov === "fal") {
-      if (!FAL_BASIC) return res.status(401).json({ success: false, error: "FAL auth missing" });
-      const url = `${FAL_BASE}${FAL_RESULT_BASE}/${encodeURIComponent(id)}`;
-      const r = await fetch(url, { headers: falHeaders() });
-      const t = await r.text();
-      let j = {};
-      try { j = JSON.parse(t); } catch { j = { raw: t }; }
-      const video_url = findVideoUrl(j);
-      return res.status(r.status).json({ success: r.ok, provider: prov, job_id: id, pending: !video_url, video_url, raw: j });
-    } else {
-      if (!KIE_KEY) return res.status(401).json({ success: false, error: "KIE auth missing" });
-      for (const pat of KIE_RESULT_PATHS) {
-        const p = pat.trim().replace(":id", encodeURIComponent(id));
-        const url = `${KIE_API_PREFIX}${p.startsWith("/") ? "" : "/"}${p}`;
-        try {
-          const r = await fetch(url, { headers: kieHeaders() });
-          const t = await r.text();
-          let j = {};
-          try { j = JSON.parse(t); } catch { j = { raw: t }; }
-          if (r.ok) {
-            const video_url = findVideoUrl(j) || (j.data && (j.data.videoUrl || j.data.url));
-            if (video_url) return res.status(200).json({ success: true, provider: prov, job_id: id, pending: false, video_url, raw: j });
-          }
-        } catch {}
-      }
-      return res.status(202).json({ success: true, provider: prov, job_id: id, pending: true });
+  // Minimal probe for scanners (submits tiny job to current/default provider)
+  router.post("/probe", async (req, res) => {
+    try {
+      const prov = withProviderParam ? (req.params.prov || DEFAULT_PROVIDER) : providerFrom(req);
+      const body = {
+        prompt: "A single color frame for endpoint test.",
+        duration: 1,
+        aspect_ratio: "16:9",
+        resolution: "720p",
+        with_audio: false
+      };
+      const fn = prov === "fal" ? submitAndMaybeWaitFAL : submitAndMaybeWaitKIE;
+      const out = await fn(body, VEO_MODEL_FAST);
+      return res.status(out.status || 200).json({
+        ok: !!out.ok,
+        provider: prov,
+        job_id: out.job_id || null,
+        pending: !!out.pending,
+        video_url: out.video_url || null,
+        meta: out.raw || {}
+      });
+    } catch (e) {
+      res.status(502).json({ ok: false, error: e?.message || String(e) });
     }
-  } catch (e) {
-    res.status(502).json({ success: false, error: e?.message || String(e) });
-  }
-});
+  });
 
-// ---------- ElevenLabs ----------
-app.get("/eleven/voices", async (_req, res) => {
-  if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
-  try {
-    const r = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": ELEVEN_KEY } });
-    const j = await r.json();
-    if (!r.ok) return res.status(r.status).json(j);
-    const voices = (j.voices || []).map(v => ({ id: v.voice_id || v.id, name: v.name, category: v.category || "" }));
-    res.json({ voices });
-  } catch (e) {
-    res.status(502).json({ error: e?.message || String(e) });
-  }
-});
-
-// JSON tts (saves to /static/tts/<file>.mp3)
-app.post("/eleven/tts", async (req, res) => {
-  if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
-  const { voice_id, text, model_id, params } = req.body || {};
-  if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
-  try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
-    const payload = {
-      text,
-      model_id: model_id || "eleven_multilingual_v2",
-      voice_settings: {
-        stability: params?.stability ?? 0.45,
-        similarity_boost: params?.similarity_boost ?? 0.8,
-        style: params?.style ?? 0.0,
-        use_speaker_boost: params?.use_speaker_boost ?? true
-      }
-    };
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg" },
-      body: JSON.stringify(payload)
-    });
-    if (!r.ok) {
-      const errTxt = await r.text().catch(()=> "");
-      return res.status(r.status).json({ error: "ElevenLabs error", detail: errTxt });
+  // Generate — fast
+  router.post(["/generate", "/generate-fast"], async (req, res) => {
+    try {
+      const prov = withProviderParam ? (req.params.prov || DEFAULT_PROVIDER) : providerFrom(req);
+      const body = req.body || {};
+      const fn = prov === "fal" ? submitAndMaybeWaitFAL : submitAndMaybeWaitKIE;
+      const out = await fn(body, VEO_MODEL_FAST);
+      res.status(out.status || 200).json({
+        success: !!out.ok,
+        provider: prov,
+        job_id: out.job_id || null,
+        pending: !!out.pending,
+        video_url: out.video_url || null,
+        meta: out.raw,
+        error: out.ok ? undefined : out.error,
+      });
+    } catch (e) {
+      res.status(502).json({ success: false, error: e?.message || String(e) });
     }
-    const buf = Buffer.from(await r.arrayBuffer());
-    const fname = `tts_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp3`;
-    await fs.writeFile(path.join(TTS_DIR, fname), buf);
-    res.json({ audio_url: `/static/tts/${fname}`, bytes: buf.length });
-  } catch (e) {
-    res.status(502).json({ error: e?.message || String(e) });
-  }
-});
+  });
 
-// Stream tts (audio/mpeg)
-app.post("/eleven/tts.stream", async (req, res) => {
-  if (!ELEVEN_KEY) return res.status(401).send("Missing ElevenLabs key");
-  const { voice_id, text, model_id, params } = req.body || {};
-  if (!voice_id || !text) return res.status(400).send("voice_id and text required");
-  try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
-    const payload = {
-      text,
-      model_id: model_id || "eleven_multilingual_v2",
-      voice_settings: {
-        stability: params?.stability ?? 0.45,
-        similarity_boost: params?.similarity_boost ?? 0.8,
-        style: params?.style ?? 0.0,
-        use_speaker_boost: params?.use_speaker_boost ?? true
+  // Generate — quality
+  router.post("/generate-quality", async (req, res) => {
+    try {
+      const prov = withProviderParam ? (req.params.prov || DEFAULT_PROVIDER) : providerFrom(req);
+      const body = req.body || {};
+      const fn = prov === "fal" ? submitAndMaybeWaitFAL : submitAndMaybeWaitKIE;
+      const out = await fn(body, VEO_MODEL_QUALITY);
+      res.status(out.status || 200).json({
+        success: !!out.ok,
+        provider: prov,
+        job_id: out.job_id || null,
+        pending: !!out.pending,
+        video_url: out.video_url || null,
+        meta: out.raw,
+        error: out.ok ? undefined : out.error,
+      });
+    } catch (e) {
+      res.status(502).json({ success: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Poll
+  router.get("/result/:jobId", async (req, res) => {
+    try {
+      const prov = withProviderParam ? (req.params.prov || DEFAULT_PROVIDER) : providerFrom(req);
+      const id = req.params.jobId;
+
+      if (prov === "fal") {
+        if (!FAL_BASIC) return res.status(401).json({ success: false, error: "FAL auth missing" });
+        const url = `${FAL_BASE}${FAL_RESULT_BASE}/${encodeURIComponent(id)}`;
+        const r = await fetch(url, { headers: falHeaders() });
+        const t = await r.text();
+        let j = {};
+        try { j = JSON.parse(t); } catch { j = { raw: t }; }
+        const video_url = findVideoUrl(j);
+        return res.status(r.status).json({ success: r.ok, provider: prov, job_id: id, pending: !video_url, video_url, raw: j });
+      } else {
+        if (!KIE_KEY) return res.status(401).json({ success: false, error: "KIE auth missing" });
+        for (const pat of KIE_RESULT_PATHS) {
+          const p = pat.trim().replace(":id", encodeURIComponent(id));
+          const url = `${KIE_API_PREFIX}${p.startsWith("/") ? "" : "/"}${p}`;
+          try {
+            const r = await fetch(url, { headers: kieHeaders() });
+            const t = await r.text();
+            let j = {};
+            try { j = JSON.parse(t); } catch { j = { raw: t }; }
+            if (r.ok) {
+              const video_url = findVideoUrl(j) || (j.data && (j.data.videoUrl || j.data.url));
+              if (video_url) return res.status(200).json({ success: true, provider: prov, job_id: id, pending: false, video_url, raw: j });
+            }
+          } catch {}
+        }
+        return res.status(202).json({ success: true, provider: prov, job_id: id, pending: true });
       }
-    };
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg" },
-      body: JSON.stringify(payload)
-    });
-    res.status(r.status);
-    r.body.pipeTo(new WritableStream({
-      start() { res.setHeader("Content-Type", "audio/mpeg"); },
-      write(chunk) { res.write(chunk); },
-      close() { res.end(); },
-      abort() { try { res.end(); } catch {} }
-    })).catch(() => { try { res.end(); } catch {} });
-  } catch {
-    res.status(502).end("TTS stream error");
-  }
-});
+    } catch (e) {
+      res.status(502).json({ success: false, error: e?.message || String(e) });
+    }
+  });
 
-// ---------- Mux ----------
-app.post("/mux", async (req, res) => {
-  if (!ENABLE_MUX) return res.status(403).json({ error: "Mux disabled. Set ENABLE_MUX=1 and ensure ffmpeg is available." });
-  const { video_url, audio_url } = req.body || {};
-  if (!video_url || !audio_url) return res.status(400).json({ error: "video_url and audio_url required" });
+  // ElevenLabs
+  router.get("/eleven/voices", async (_req, res) => {
+    if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
+    try {
+      const r = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": ELEVEN_KEY } });
+      const j = await r.json();
+      if (!r.ok) return res.status(r.status).json(j);
+      const voices = (j.voices || []).map(v => ({ id: v.voice_id || v.id, name: v.name, category: v.category || "" }));
+      res.json({ voices });
+    } catch (e) {
+      res.status(502).json({ error: e?.message || String(e) });
+    }
+  });
 
-  const vPath = path.join(TMP_ROOT, `v_${Date.now()}.mp4`);
-  const aPath = path.join(TMP_ROOT, `a_${Date.now()}.mp3`);
-  const outPath = path.join(MUX_DIR, `out_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp4`);
+  router.post("/eleven/tts", async (req, res) => {
+    if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
+    const { voice_id, text, model_id, params } = req.body || {};
+    if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
+    try {
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
+      const payload = {
+        text,
+        model_id: model_id || "eleven_multilingual_v2",
+        voice_settings: {
+          stability: params?.stability ?? 0.45,
+          similarity_boost: params?.similarity_boost ?? 0.8,
+          style: params?.style ?? 0.0,
+          use_speaker_boost: params?.use_speaker_boost ?? true
+        }
+      };
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg" },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        const errTxt = await r.text().catch(()=> "");
+        return res.status(r.status).json({ error: "ElevenLabs error", detail: errTxt });
+      }
+      const buf = Buffer.from(await r.arrayBuffer());
+      const fname = `tts_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp3`;
+      await fs.writeFile(path.join(TTS_DIR, fname), buf);
+      res.json({ audio_url: `/static/tts/${fname}`, bytes: buf.length });
+    } catch (e) {
+      res.status(502).json({ error: e?.message || String(e) });
+    }
+  });
 
-  try {
-    const dl = async (u, fp) => {
-      const r = await fetch(u);
-      if (!r.ok) throw new Error(`Download failed: ${u} -> ${r.status}`);
-      const b = Buffer.from(await r.arrayBuffer());
-      await fs.writeFile(fp, b);
-    };
-    await dl(video_url, vPath);
-    await dl(audio_url, aPath);
+  router.post("/eleven/tts.stream", async (req, res) => {
+    if (!ELEVEN_KEY) return res.status(401).send("Missing ElevenLabs key");
+    const { voice_id, text, model_id, params } = req.body || {};
+    if (!voice_id || !text) return res.status(400).send("voice_id and text required");
+    try {
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
+      const payload = {
+        text,
+        model_id: model_id || "eleven_multilingual_v2",
+        voice_settings: {
+          stability: params?.stability ?? 0.45,
+          similarity_boost: params?.similarity_boost ?? 0.8,
+          style: params?.style ?? 0.0,
+          use_speaker_boost: params?.use_speaker_boost ?? true
+        }
+      };
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg" },
+        body: JSON.stringify(payload)
+      });
+      res.status(r.status);
+      r.body.pipeTo(new WritableStream({
+        start() { res.setHeader("Content-Type", "audio/mpeg"); },
+        write(chunk) { res.write(chunk); },
+        close() { res.end(); },
+        abort() { try { res.end(); } catch {} }
+      })).catch(() => { try { res.end(); } catch {} });
+    } catch {
+      res.status(502).end("TTS stream error");
+    }
+  });
 
-    const args = ["-y", "-i", vPath, "-i", aPath, "-c:v", "copy", "-c:a", "aac", "-shortest", outPath];
-    const proc = spawn(FFMPEG_PATH, args);
-    proc.on("error", err => res.status(500).json({ error: "FFmpeg spawn failed", detail: String(err) }));
-    proc.on("close", async (code) => {
-      try { await fs.rm(vPath,{force:true}); await fs.rm(aPath,{force:true}); } catch {}
-      if (code !== 0) return res.status(500).json({ error: `FFmpeg exit ${code}` });
-      res.json({ merged_url: `/static/mux/${path.basename(outPath)}` });
-    });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || String(e) });
-  }
-});
+  // ---------- Mux ----------
+  router.post("/mux", async (req, res) => {
+    if (!ENABLE_MUX) return res.status(403).json({ error: "Mux disabled. Set ENABLE_MUX=1 and ensure ffmpeg is available." });
+    const { video_url, audio_url } = req.body || {};
+    if (!video_url || !audio_url) return res.status(400).json({ error: "video_url and audio_url required" });
+
+    const vPath = path.join(TMP_ROOT, `v_${Date.now()}.mp4`);
+    const aPath = path.join(TMP_ROOT, `a_${Date.now()}.mp3`);
+    const outPath = path.join(MUX_DIR, `out_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp4`);
+
+    try {
+      const dl = async (u, fp) => {
+        const r = await fetch(u);
+        if (!r.ok) throw new Error(`Download failed: ${u} -> ${r.status}`);
+        const b = Buffer.from(await r.arrayBuffer());
+        await fs.writeFile(fp, b);
+      };
+      await dl(video_url, vPath);
+      await dl(audio_url, aPath);
+
+      const args = ["-y", "-i", vPath, "-i", aPath, "-c:v", "copy", "-c:a", "aac", "-shortest", outPath];
+      const proc = spawn(FFMPEG_PATH, args);
+      proc.on("error", err => res.status(500).json({ error: "FFmpeg spawn failed", detail: String(err) }));
+      proc.on("close", async (code) => {
+        try { await fs.rm(vPath,{force:true}); await fs.rm(aPath,{force:true}); } catch {}
+        if (code !== 0) return res.status(500).json({ error: `FFmpeg exit ${code}` });
+        res.json({ merged_url: `/static/mux/${path.basename(outPath)}` });
+      });
+    } catch (e) {
+      res.status(500).json({ error: e?.message || String(e) });
+    }
+  });
+}
+
+// Register at root…
+registerRoutes(app, /*withProviderParam=*/false);
+
+// …and mirror everything under /provider/:prov/*
+const providerRouter = express.Router({ mergeParams: true });
+providerRouter.use((req, _res, next) => { req.query.provider = req.params.prov; next(); });
+registerRoutes(providerRouter, /*withProviderParam=*/true);
+app.use("/provider/:prov", providerRouter);
 
 // Static
 app.use("/static", express.static(STATIC_ROOT, {
   setHeaders: (res) => res.setHeader("Cache-Control", "public, max-age=31536000, immutable")
 }));
 
-// Root
+// Root catch
 app.get("/", (_req, res) => res.status(404).send("OK"));
 
 app.listen(PORT, () => {
