@@ -1,4 +1,4 @@
-// server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux
+// server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux + DL routes
 // Node 18+, CommonJS
 console.log("[BOOT] starting veo3-backend-dual …");
 process.on("uncaughtException", e => console.error("[FATAL]", e));
@@ -336,6 +336,82 @@ app.get("/result/:jobId", async (req, res) => {
     res.status(502).json({ success: false, error: e?.message || String(e) });
   }
 });
+
+// ---------- DOWNLOAD ROUTES ----------
+// 1) Clean redirect by job id: GET /dl/:jobId  -> 302 to final MP4 when ready
+app.get("/dl/:jobId", async (req, res) => {
+  try {
+    const id = req.params.jobId;
+
+    // 1) Try cache first
+    const cached = cache.get(id);
+    if (cached) return res.redirect(302, cached);
+
+    // 2) Ask our own /result to resolve file_url
+    const base = `${req.protocol}://${req.get("host")}`;
+    const r = await fetch(`${base}/result/${encodeURIComponent(id)}?provider=${encodeURIComponent(providerFrom(req))}`);
+    const j = await r.json().catch(()=> ({}));
+
+    const file = j?.video_url || null;
+    if (!file) {
+      // Not ready vs not found: /result uses 202 for pending; treat as 409 here
+      return res.status(409).json({ error: "not_ready", id, detail: j || null });
+    }
+
+    // Optional allowlist to avoid open redirects
+    try {
+      const u = new URL(file);
+      const allowed = [
+        "r2.cloudflarestorage.com",
+        "s3.amazonaws.com",
+        "storage.googleapis.com",
+        "cdn.runwayml.com",
+        "runwayml.com",
+        "files.kie.ai",
+        "cdn.kie.ai"
+      ];
+      if (!allowed.includes(u.host)) {
+        return res.status(400).json({ error: "disallowed_host", host: u.host });
+      }
+    } catch {
+      return res.status(400).json({ error: "bad_file_url" });
+    }
+
+    return res.redirect(302, file);
+  } catch (err) {
+    console.error("DL route error:", err?.message || err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// 2) Simple passthrough: GET /dl?u=<encoded url> -> 302 to that URL (host allowlisted)
+app.get("/dl", (req, res) => {
+  try {
+    const u = req.query.u;
+    if (!u) return res.status(400).json({ error: "missing_u" });
+    const parsed = new URL(u);
+    const allowed = [
+      "r2.cloudflarestorage.com",
+      "s3.amazonaws.com",
+      "storage.googleapis.com",
+      "cdn.runwayml.com",
+      "runwayml.com",
+      "files.kie.ai",
+      "cdn.kie.ai"
+    ];
+    if (!allowed.includes(parsed.host)) {
+      return res.status(400).json({ error: "disallowed_host", host: parsed.host });
+    }
+    return res.redirect(302, u);
+  } catch {
+    return res.status(400).json({ error: "bad_url" });
+  }
+});
+
+// --- /api/* aliases so frontends calling /api/... also work ---
+app.get("/api/result/:jobId", (req,res,next)=>{ req.url=`/result/${req.params.jobId}`; app._router.handle(req,res,next); });
+app.get("/api/dl/:jobId", (req,res,next)=>{ req.url=`/dl/${req.params.jobId}`; app._router.handle(req,res,next); });
+app.get("/api/dl", (req,res,next)=>{ req.url="/dl"; app._router.handle(req,res,next); });
 
 // ---------- ElevenLabs ----------
 app.get("/eleven/voices", async (_req, res) => {
