@@ -398,6 +398,7 @@ app.get("/dl", (req, res) => {
       "cdn.runwayml.com",
       "runwayml.com",
       "files.kie.ai",
+      "tempfile.aiquickdraw.com",
       "cdn.kie.ai"
     ];
     if (!allowed.includes(parsed.host)) {
