@@ -25,22 +25,21 @@ app.use((req, res, next) => {
 // ---------- ENV ----------
 const PORT = process.env.PORT || 8080;
 const DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "kie").toLowerCase(); // "kie" | "fal"
+const DEBUG_LOG = String(process.env.DEBUG || "").trim() === "1";
 
 // ----- KIE -----
 const KIE_KEY = process.env.KIE_KEY || "";
-
 // IMPORTANT: KIE public base is /api/v1/veo (not /veo3)
 let KIE_API_PREFIX = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1/veo").replace(/\/$/, "");
-KIE_API_PREFIX = KIE_API_PREFIX.replace(/\/veo3(\/|$)/, "/veo$1"); // normalize any accidental …/veo3 → …/veo
+// normalize any accidental ".../veo3" to ".../veo"
+KIE_API_PREFIX = KIE_API_PREFIX.replace(/\/veo3(\/|$)/, "/veo$1");
 
 // Submit is /generate for both fast/quality, model flag decides
 const KIE_FAST_PATH = process.env.KIE_FAST_PATH || process.env.VEO_FAST_PATH || "/generate";
 const KIE_QUALITY_PATH = process.env.KIE_QUALITY_PATH || "/generate";
-
 // Polling endpoint returns record info by taskId
 const KIE_RESULT_PATHS = (process.env.KIE_RESULT_PATHS || "/record-info?taskId=:id").split(",");
-
-// Optional 1080p fetch (some tenants expose this)
+// Optional 1080p fetch
 const KIE_HD_PATH = process.env.KIE_HD_PATH || "/get-1080p-video?taskId=:id";
 
 // ----- FAL -----
@@ -100,6 +99,49 @@ function kieHeaders(extra = {}) {
   return h;
 }
 
+// Log helper
+function dlog(...args) {
+  if (DEBUG_LOG) console.log("[DEBUG]", ...args);
+}
+
+// Extract a job id from any shape KIE might return
+function findJobIdKIE(j) {
+  if (!j) return null;
+  const tryKeys = ["taskId","task_id","requestId","request_id","id","job_id","task","data","result","meta"];
+  const seen = new Set();
+  const stack = [j];
+  while (stack.length) {
+    const v = stack.pop();
+    if (!v || typeof v !== "object") continue;
+
+    for (const k of Object.keys(v)) {
+      if (seen.has(v[k])) continue;
+      const val = v[k];
+      if (typeof val === "string") {
+        // UUID-like or non-empty id string
+        if (k.toLowerCase().includes("task") || k.toLowerCase().includes("request") || k.toLowerCase().endsWith("id")) {
+          if (val.trim().length >= 10) return val.trim();
+        }
+        // sometimes KIE returns JSON string
+        if ((val.startsWith("{") && val.endsWith("}")) || (val.startsWith("[") && val.endsWith("]"))) {
+          try {
+            const parsed = JSON.parse(val);
+            stack.push(parsed);
+          } catch {}
+        }
+      } else if (typeof val === "object") {
+        stack.push(val);
+      }
+    }
+
+    // direct hits
+    for (const key of tryKeys) {
+      if (typeof v[key] === "string" && v[key].trim()) return v[key].trim();
+    }
+  }
+  return null;
+}
+
 // Extract first playable URL from a messy payload
 function findVideoUrl(maybe) {
   if (!maybe) return null;
@@ -141,21 +183,6 @@ function findVideoUrl(maybe) {
   return null;
 }
 
-// Safely dig for any id-like field
-function deepFindId(obj) {
-  const keys = ["taskId","task_id","id","job_id","request_id"];
-  const q = [obj];
-  while (q.length) {
-    const v = q.pop();
-    if (!v || typeof v !== "object") continue;
-    for (const k of Object.keys(v)) {
-      if (keys.includes(k) && typeof v[k] === "string" && v[k]) return v[k];
-      if (v[k] && typeof v[k] === "object") q.push(v[k]);
-    }
-  }
-  return null;
-}
-
 // ---------- Providers ----------
 async function submitAndMaybeWaitFAL(body, modelName) {
   const payload = { ...body, model: modelName };
@@ -165,12 +192,12 @@ async function submitAndMaybeWaitFAL(body, modelName) {
   const t = await r.text();
   let j = {};
   try { j = JSON.parse(t); } catch { j = { raw: t }; }
-  if (!r.ok) {
-    console.error("[FAL] submit failed", r.status, t);
-    return { ok: false, status: r.status, error: j?.error || t || `FAL submit ${r.status}`, raw: j };
-  }
+  if (!r.ok) return { ok: false, status: r.status, error: j?.error || t || `FAL submit ${r.status}`, raw: j };
 
-  const jid = deepFindId(j);
+  const jid =
+    j.request_id || j.id || j.job_id ||
+    (j.data && (j.data.request_id || j.data.id)) || null;
+
   const urlNow = findVideoUrl(j);
   if (urlNow) return { ok: true, status: 200, job_id: jid, video_url: urlNow, raw: j };
   if (!jid) return { ok: true, status: 202, pending: true, job_id: null, raw: j };
@@ -196,27 +223,21 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   const submitPath = modelName === VEO_MODEL_FAST ? KIE_FAST_PATH : KIE_QUALITY_PATH;
   const submitURL = `${KIE_API_PREFIX}${submitPath.startsWith("/") ? "" : "/"}${submitPath}`;
 
+  dlog("KIE submit URL:", submitURL);
   const r = await fetch(submitURL, { method: "POST", headers: kieHeaders(), body: JSON.stringify(payload) });
   const t = await r.text();
   let j = {};
   try { j = JSON.parse(t); } catch { j = { raw: t }; }
+  dlog("KIE submit status:", r.status, "body:", j);
 
-  if (!r.ok) {
-    console.error("[KIE] submit failed", r.status, t);
-    return { ok: false, status: r.status, error: j?.error || t || `KIE submit ${r.status}`, raw: j };
-  }
+  if (!r.ok) return { ok: false, status: r.status, error: j?.error || t || `KIE submit ${r.status}`, raw: j };
 
-  // --------- Robust job_id extraction + logging ---------
-  let jid =
+  const jid =
+    findJobIdKIE(j) ||
     j.taskId || j.task_id || j.id || j.job_id ||
     (j.data && (j.data.taskId || j.data.task_id || j.data.id)) ||
     (j.result && (j.result.taskId || j.result.id)) ||
-    (j.job && (j.job.taskId || j.job.id)) ||
-    deepFindId(j) || null;
-
-  if (!jid) {
-    console.error("[KIE] No job_id found in submit response, payload follows:\n", JSON.stringify(j, null, 2));
-  }
+    null;
 
   const urlNow = findVideoUrl(j);
   if (urlNow) return { ok: true, status: 200, job_id: jid, video_url: urlNow, raw: j };
@@ -234,10 +255,10 @@ async function submitAndMaybeWaitKIE(body, modelName) {
         const tt = await rr.text();
         let jj = {};
         try { jj = JSON.parse(tt); } catch { jj = { raw: tt }; }
+        dlog("KIE poll", url, "status:", rr.status, "body:", jj);
         if (rr.ok) {
           const u = findVideoUrl(jj);
           if (u) {
-            // Try HD once; if not available, return u
             try {
               const hdUrl = `${KIE_API_PREFIX}${KIE_HD_PATH.startsWith("/") ? "" : "/"}${KIE_HD_PATH.replace(":id", encodeURIComponent(jid))}`;
               const hdRes = await fetch(hdUrl, { headers: kieHeaders() });
@@ -250,7 +271,9 @@ async function submitAndMaybeWaitKIE(body, modelName) {
             return { ok: true, status: 200, job_id: jid, video_url: u, raw: jj };
           }
         }
-      } catch {}
+      } catch (e) {
+        dlog("KIE poll error:", e?.message || e);
+      }
     }
   }
   return { ok: true, status: 202, pending: true, job_id: jid, raw: j };
@@ -291,7 +314,7 @@ function registerRoutes(router, withProviderParam = false) {
     });
   });
 
-  // Minimal probe for scanners (submits tiny job to current/default provider)
+  // Minimal probe (tiny job)
   router.post("/probe", async (req, res) => {
     try {
       const prov = withProviderParam ? (req.params.prov || DEFAULT_PROVIDER) : providerFrom(req);
@@ -416,7 +439,7 @@ function registerRoutes(router, withProviderParam = false) {
     const { voice_id, text, model_id, params } = req.body || {};
     if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
     try {
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`
       const payload = {
         text,
         model_id: model_id || "eleven_multilingual_v2",
@@ -510,6 +533,28 @@ function registerRoutes(router, withProviderParam = false) {
       res.status(500).json({ error: e?.message || String(e) });
     }
   });
+
+  // ---------- Debug: dump KIE raw response ----------
+  router.get("/debug/generate", async (_req, res) => {
+    try {
+      const payload = {
+        prompt: "debug frame",
+        duration: 1,
+        aspect_ratio: "16:9",
+        resolution: "720p",
+        with_audio: false,
+        model: VEO_MODEL_FAST
+      };
+      const submitURL = `${KIE_API_PREFIX}${KIE_FAST_PATH.startsWith("/") ? "" : "/"}${KIE_FAST_PATH}`;
+      const r = await fetch(submitURL, { method: "POST", headers: kieHeaders(), body: JSON.stringify(payload) });
+      const text = await r.text();
+      let json;
+      try { json = JSON.parse(text); } catch { json = { raw: text }; }
+      res.status(r.status).json({ status: r.status, raw: json });
+    } catch (e) {
+      res.status(500).json({ error: e?.message || String(e) });
+    }
+  });
 }
 
 // Register at root…
@@ -528,27 +573,7 @@ app.use("/static", express.static(STATIC_ROOT, {
 
 // Root catch
 app.get("/", (_req, res) => res.status(404).send("OK"));
-// Debug route: directly hit KIE with a tiny test job and dump full JSON
-app.get("/debug/generate", async (req, res) => {
-  try {
-    const payload = {
-      prompt: "debug frame",
-      duration: 1,
-      aspect_ratio: "16:9",
-      resolution: "720p",
-      with_audio: false,
-      model: VEO_MODEL_FAST
-    };
-    const submitURL = `${KIE_API_PREFIX}${KIE_FAST_PATH.startsWith("/") ? "" : "/"}${KIE_FAST_PATH}`;
-    const r = await fetch(submitURL, { method: "POST", headers: kieHeaders(), body: JSON.stringify(payload) });
-    const text = await r.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = { raw: text }; }
-    res.status(r.status).json({ status: r.status, raw: json });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || String(e) });
-  }
-});
+
 app.listen(PORT, () => {
   console.log(`[OK] backend listening on :${PORT}`);
   console.log(`[DEFAULT] provider: ${DEFAULT_PROVIDER}`);
