@@ -55,8 +55,8 @@ const FAL_SUBMIT_PATH = process.env.FAL_SUBMIT_PATH || "/v1/pipelines/google/veo
 const FAL_RESULT_BASE = (process.env.FAL_RESULT_BASE || "/v1/pipelines/google/veo/requests").replace(/\/$/, "");
 
 // Models
-const VEO_MODEL_FAST = process.env.VEO_MODEL_FAST || "V3_5";
-const VEO_MODEL_QUALITY = process.env.VEO_MODEL_QUALITY || "V4_5PLUS";
+const VEO_MODEL_FAST = process.env.VEO_MODEL_FAST || "veo-3-fast";
+const VEO_MODEL_QUALITY = process.env.VEO_MODEL_QUALITY || "veo-3-quality";
 
 // ----- ElevenLabs -----
 const ELEVEN_KEY =
