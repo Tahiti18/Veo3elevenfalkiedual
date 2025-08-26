@@ -50,7 +50,7 @@ if (FAL_KEY_ID && FAL_KEY_SECRET) FAL_BASIC = Buffer.from(`${FAL_KEY_ID}:${FAL_K
 else if (FAL_KEY.includes(":")) FAL_BASIC = Buffer.from(FAL_KEY).toString("base64");
 
 const FAL_BASE = (process.env.FAL_API_BASE || "https://api.fal.ai").replace(/\/$/, "");
-const FAL_SUBMIT_PATH = process.env.FAL_SUBMIT_PATH || "/v1/pipelines/google/veo/submit";
+const FAL_SUBMIT_PATH = (process.env.FAL_SUBMIT_PATH || "/v1/pipelines/google/veo/submit");
 const FAL_RESULT_BASE = (process.env.FAL_RESULT_BASE || "/v1/pipelines/google/veo/requests").replace(/\/$/, "");
 
 // Models (docs)
@@ -97,6 +97,19 @@ function kieHeaders(extra = {}) {
   const h = { "Content-Type": "application/json", ...extra };
   if (KIE_KEY) h["Authorization"] = `Bearer ${KIE_KEY}`;
   return h;
+}
+
+// --- Aspect ratio normalizer (ensures "9:16" is honored) ---
+function normalizeAspect(aspect) {
+  if (!aspect) return "16:9";
+  const map = {
+    "16:9": "16:9",
+    "9:16": "9:16",
+    "1:1": "1:1",
+    "4:3": "4:3",
+    "3:4": "3:4"
+  };
+  return map[aspect] || "16:9";
 }
 
 // Host allowlist for redirects/downloads
@@ -180,7 +193,7 @@ async function backgroundPollKIE(taskId) {
 
 // ---------- Providers ----------
 async function submitAndMaybeWaitFAL(body, modelName) {
-  const payload = { ...body, model: modelName };
+  const payload = { ...body, model: modelName, aspect: normalizeAspect(body.aspect) };
   const submitURL = FAL_BASE + FAL_SUBMIT_PATH;
 
   const r = await fetch(submitURL, { method: "POST", headers: falHeaders(), body: JSON.stringify(payload) });
@@ -211,7 +224,7 @@ async function submitAndMaybeWaitFAL(body, modelName) {
 }
 
 async function submitAndMaybeWaitKIE(body, modelName) {
-  const payload = { ...body, model: modelName }; // model must be "veo3" or "veo3_fast"
+  const payload = { ...body, model: modelName, aspect: normalizeAspect(body.aspect) }; // model must be "veo3" or "veo3_fast"
   const submitPath = modelName === VEO_MODEL_FAST ? KIE_FAST_PATH : KIE_QUALITY_PATH;
   const submitURL = `${KIE_API_PREFIX}${submitPath.startsWith("/") ? "" : "/"}${submitPath}`;
 
@@ -552,7 +565,7 @@ app.post("/eleven/tts", async (req, res) => {
     };
     const r = await fetch(url, {
       method: "POST",
-      headers: { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json", "Accept": "audio/mpeg" },
+      headers: { "xi-api-key": ELEVEN_KEY, "Content-Type":"application/json", "Accept":"audio/mpeg" },
       body: JSON.stringify(payload)
     });
     if (!r.ok) {
