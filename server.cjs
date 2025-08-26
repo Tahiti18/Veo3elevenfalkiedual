@@ -1,5 +1,3 @@
-Latest3 good cjs
-
 // server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux + DL routes
 // Node 18+, CommonJS
 console.log("[BOOT] starting veo3-backend-dual …");
