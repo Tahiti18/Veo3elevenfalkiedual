@@ -17,7 +17,7 @@ app.use(express.json({ limit: "2mb" }));
 // ---- CORS (explicit preflight 204) ----
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Range");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -102,13 +102,7 @@ function kieHeaders(extra = {}) {
 // --- Aspect ratio normalizer (ensures "9:16" is honored) ---
 function normalizeAspect(aspect) {
   if (!aspect) return "16:9";
-  const map = {
-    "16:9": "16:9",
-    "9:16": "9:16",
-    "1:1": "1:1",
-    "4:3": "4:3",
-    "3:4": "3:4"
-  };
+  const map = { "16:9":"16:9","9:16":"9:16","1:1":"1:1","4:3":"4:3","3:4":"3:4" };
   return map[aspect] || "16:9";
 }
 
@@ -121,11 +115,11 @@ const ALLOWED_HOSTS = new Set([
   "runwayml.com",
   "files.kie.ai",
   "cdn.kie.ai",
-  "tempfile.aiquickdraw.com"
+  "video.kie.ai",
+  "tempfile.aiquickdraw.com",
+  "fal.media"
 ]);
-function isAllowedHost(u) {
-  try { return ALLOWED_HOSTS.has(new URL(u).host); } catch { return false; }
-}
+function isAllowedHost(u) { try { return ALLOWED_HOSTS.has(new URL(u).host); } catch { return false; } }
 
 // Extract first playable URL from a messy payload
 function findVideoUrl(maybe) {
@@ -135,7 +129,6 @@ function findVideoUrl(maybe) {
     while (stack.length) {
       const v = stack.pop();
       if (typeof v === "string" && /https?:\/\/.+\.(mp4|mov|m4v|m3u8)(\?|$)/i.test(v)) return v;
-
       if (v && typeof v === "object") {
         if (typeof v.video_url === "string") return v.video_url;
         if (v.output && typeof v.output.video_url === "string") return v.output.video_url;
@@ -143,8 +136,6 @@ function findVideoUrl(maybe) {
         if (typeof v.url === "string" && /^https?:\/\//.test(v.url)) return v.url;
         if (v.data && (typeof v.data.url === "string" || typeof v.data.video_url === "string"))
           return v.data.video_url || v.data.url;
-
-        // KIE specific: data.resultUrls string or array
         if (v.data) {
           const ru = v.data.resultUrls || v.data.resultUrl || v.data.videoUrl;
           if (typeof ru === "string") {
@@ -152,12 +143,8 @@ function findVideoUrl(maybe) {
               const arr = JSON.parse(ru);
               if (Array.isArray(arr) && arr.length && typeof arr[0] === "string") return arr[0];
               if (/https?:\/\//.test(ru)) return ru;
-            } catch {
-              if (/https?:\/\//.test(ru)) return ru;
-            }
-          } else if (Array.isArray(ru) && ru.length && typeof ru[0] === "string") {
-            return ru[0];
-          }
+            } catch { if (/https?:\/\//.test(ru)) return ru; }
+          } else if (Array.isArray(ru) && ru.length && typeof ru[0] === "string") return ru[0];
         }
         for (const k of Object.keys(v)) stack.push(v[k]);
       }
@@ -166,11 +153,10 @@ function findVideoUrl(maybe) {
   return null;
 }
 
-// Small in-memory cache of jobId -> video_url (helps the frontend auto-show in history)
+// Small in-memory cache of jobId -> video_url
 const cache = new Map();
 async function backgroundPollKIE(taskId) {
   if (!taskId) return;
-  // Try up to ~60–70s
   for (let i = 0; i < 8; i++) {
     await sleep(i === 0 ? 4000 : 8000);
     for (const pat of KIE_RESULT_PATHS) {
@@ -224,7 +210,7 @@ async function submitAndMaybeWaitFAL(body, modelName) {
 }
 
 async function submitAndMaybeWaitKIE(body, modelName) {
-  const payload = { ...body, model: modelName, aspect: normalizeAspect(body.aspect) }; // model must be "veo3" or "veo3_fast"
+  const payload = { ...body, model: modelName, aspect: normalizeAspect(body.aspect) };
   const submitPath = modelName === VEO_MODEL_FAST ? KIE_FAST_PATH : KIE_QUALITY_PATH;
   const submitURL = `${KIE_API_PREFIX}${submitPath.startsWith("/") ? "" : "/"}${submitPath}`;
 
@@ -234,7 +220,6 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   try { j = JSON.parse(t); } catch { j = { raw: t }; }
   if (!r.ok) return { ok: false, status: r.status, error: j?.msg || j?.error || t || `KIE submit ${r.status}`, raw: j };
 
-  // success shape: { code:200, data:{ taskId: "..." }, msg:"success" }
   const jid =
     j.taskId || j.task_id || j.id || j.job_id ||
     (j.data && (j.data.taskId || j.data.task_id || j.data.id)) ||
@@ -333,7 +318,6 @@ app.get("/result/:jobId", async (req, res) => {
     const prov = providerFrom(req);
     const id = req.params.jobId;
 
-    // serve from cache if present
     const cached = cache.get(id);
     if (cached) return res.status(200).json({ success: true, provider: prov, job_id: id, pending: false, video_url: cached });
 
@@ -395,7 +379,6 @@ async function proxyStreamToClient(req, res, fileUrl, opts = {}) {
     return res.status(upstream.status || 502).json({ error: "upstream_error", detail: text.slice(0, 500) });
   }
 
-  // Pass through content type & length if present
   const ct = upstream.headers.get("content-type") || "video/mp4";
   const cl = upstream.headers.get("content-length");
   const acceptRanges = upstream.headers.get("accept-ranges");
@@ -411,16 +394,13 @@ async function proxyStreamToClient(req, res, fileUrl, opts = {}) {
     res.setHeader("Content-Disposition", `attachment; filename="${safe}"`);
   }
 
-  // Optional local cache (full file only, no partial writes)
   if (ENABLE_DL_CACHE && cacheId && !req.headers.range) {
     const outPath = path.join(VID_DIR, `${cacheId}.mp4`);
-    // If already cached, serve from disk
     if (fssync.existsSync(outPath)) {
       const stat = fssync.statSync(outPath);
       res.setHeader("Content-Length", stat.size);
       return fssync.createReadStream(outPath).pipe(res);
     }
-    // Cache as we stream (with size guard)
     let written = 0;
     const file = fssync.createWriteStream(outPath);
     upstream.body.on("data", chunk => {
@@ -434,15 +414,11 @@ async function proxyStreamToClient(req, res, fileUrl, opts = {}) {
     upstream.body.on("error", () => {
       try { file.destroy(); fssync.rmSync(outPath, { force: true }); } catch {}
     });
-    upstream.body.on("end", () => {
-      try { file.end(); } catch {}
-    });
-    // Pipe both to client and file
+    upstream.body.on("end", () => { try { file.end(); } catch {} });
     upstream.body.pipe(file);
     return upstream.body.pipe(res);
   }
 
-  // No caching: just stream to client (with size guard)
   let sent = 0;
   upstream.body.on("data", chunk => {
     sent += chunk.length;
@@ -454,7 +430,7 @@ async function proxyStreamToClient(req, res, fileUrl, opts = {}) {
   return upstream.body.pipe(res);
 }
 
-// Nightly cache cleanup (best-effort)
+// Nightly cache cleanup
 if (ENABLE_DL_CACHE) {
   setInterval(async () => {
     try {
@@ -463,39 +439,50 @@ if (ENABLE_DL_CACHE) {
       for (const f of files) {
         const fp = path.join(VID_DIR, f);
         const st = await fs.stat(fp);
-        if (now - st.mtimeMs > 24 * 3600 * 1000) {
-          await fs.rm(fp, { force: true });
-        }
+        if (now - st.mtimeMs > 24 * 3600 * 1000) await fs.rm(fp, { force: true });
       }
     } catch {}
-  }, 6 * 3600 * 1000); // every 6h
+  }, 6 * 3600 * 1000);
 }
 
 // ---------- DOWNLOAD ROUTES ----------
+
+// HEAD /dl — probe (always lightweight; never throws)
+app.head("/dl", async (req, res) => {
+  try {
+    const u = req.query.u;
+    if (!u || !isAllowedHost(u)) return res.sendStatus(204); // neutral OK for UI
+    // Do a lightweight HEAD; if upstream blocks, still return 204
+    try {
+      const r = await fetch(u, { method: "HEAD" });
+      res.status(r.ok ? 204 : 204).end(); // always 204 for safety
+    } catch { res.sendStatus(204); }
+  } catch { res.sendStatus(204); }
+});
+
 // 1) Clean redirect by job id: GET /dl/:jobId  -> preview 302, or forced download ?download=1
 app.get("/dl/:jobId", async (req, res) => {
   try {
     const id = req.params.jobId;
 
-    // Try cache map first
     let file = cache.get(id);
     if (!file) {
-      // Resolve via our own /result
       const base = `${req.protocol}://${req.get("host")}`;
-      const r = await fetch(`${base}/result/${encodeURIComponent(id)}?provider=${encodeURIComponent(providerFrom(req))}`);
-      const j = await r.json().catch(()=> ({}));
+      const r = await fetch(`${base}/result/${encodeURIComponent(id)}?provider=${encodeURIComponent(providerFrom(req))}`).catch(()=>null);
+      const j = r && await r.json().catch(()=> ({}));
       file = j?.video_url || null;
     }
-
     if (!file) return res.status(409).json({ error: "not_ready", id });
 
-    const forceDownload = String(req.query.download || "") === "1";
+    // iOS/iPad: force attachment by default
+    const ua = String(req.headers["user-agent"] || "").toLowerCase();
+    const isiOS = /ipad|iphone|ipod/.test(ua);
+    const forceDownload = isiOS || String(req.query.download || "") === "1";
+
     if (!forceDownload) {
       if (!isAllowedHost(file)) return res.status(400).json({ error: "disallowed_host", host: new URL(file).host });
       return res.redirect(302, file);
     }
-
-    // Forced download with Range support + (optional) cache
     return proxyStreamToClient(req, res, file, {
       attachmentName: `${id}.mp4`,
       passRange: true,
@@ -507,19 +494,25 @@ app.get("/dl/:jobId", async (req, res) => {
   }
 });
 
-// 2) Simple passthrough: GET /dl?u=<encoded url> -> preview 302 or forced download with ?download=1
+// 2) Simple passthrough: GET /dl?u=<encoded url>
+//    - iOS/iPad forces attachment unless ?download=0
 app.get("/dl", async (req, res) => {
   try {
     const u = req.query.u;
     if (!u) return res.status(400).json({ error: "missing_u" });
     if (!isAllowedHost(u)) return res.status(400).json({ error: "disallowed_host", host: new URL(u).host });
 
-    const forceDownload = String(req.query.download || "") === "1";
+    const ua = String(req.headers["user-agent"] || "").toLowerCase();
+    const isiOS = /ipad|iphone|ipod/.test(ua);
+
+    const wantDownloadFlag = req.query.download;
+    const forceDownload = (isiOS && wantDownloadFlag !== "0") || wantDownloadFlag === "1";
+
     if (!forceDownload) return res.redirect(302, u);
 
-    const name = req.query.name ? String(req.query.name) : `video_${Date.now()}.mp4`;
+    const fn = (req.query.filename || req.query.name || `video_${Date.now()}.mp4`).toString();
     return proxyStreamToClient(req, res, u, {
-      attachmentName: name,
+      attachmentName: fn,
       passRange: true,
       cacheId: null
     });
@@ -614,10 +607,12 @@ app.post("/mux", async (req, res) => {
 
     const args = ["-y", "-i", vPath, "-i", aPath, "-c:v", "copy", "-c:a", "aac", "-shortest", outPath];
     const proc = spawn(FFMPEG_PATH, args);
+    let logged = "";
+    proc.stderr.on("data", d => { logged += d.toString(); if (logged.length > 4000) logged = logged.slice(-4000); });
     proc.on("error", err => res.status(500).json({ error: "FFmpeg spawn failed", detail: String(err) }));
     proc.on("close", async (code) => {
       try { await fs.rm(vPath,{force:true}); await fs.rm(aPath,{force:true}); } catch {}
-      if (code !== 0) return res.status(500).json({ error: `FFmpeg exit ${code}` });
+      if (code !== 0) return res.status(500).json({ error: `FFmpeg exit ${code}`, log: logged });
       res.json({ merged_url: `/static/mux/${path.basename(outPath)}` });
     });
   } catch (e) {
@@ -633,10 +628,20 @@ app.use("/static", express.static(STATIC_ROOT, {
 // Root catch
 app.get("/", (_req, res) => res.status(404).send("OK"));
 
-app.listen(PORT, () => {
+// ---- STARTUP (Railway-friendly) ----
+const server = app.listen(PORT, () => {
   console.log(`[OK] backend listening on :${PORT}`);
   console.log(`[DEFAULT] provider: ${DEFAULT_PROVIDER}`);
   console.log(`[KIE] prefix: ${KIE_API_PREFIX}, fastPath: ${KIE_FAST_PATH}, qualityPath: ${KIE_QUALITY_PATH}, hasAuth: ${!!KIE_KEY}`);
-  console.log(`[FAL] base: ${FAL_BASE}, submit: ${FAL_SUBMIT_PATH}, resultBase: ${FAL_RESULT_BASE}, hasAuth: ${!!FAL_BASIC}`);
+  console.log(`[FAL] base: ${FAL_BASE}, submit: ${FAL_SUBMIT_PATH}, resultBase: ${FAL_RESULT_BASE}, hasAuth: !!${!!FAL_BASIC}`);
   console.log(`[ElevenLabs] key present: ${!!ELEVEN_KEY}, mux: ${ENABLE_MUX}`);
 });
+
+// Graceful shutdown (prevents scary red SIGTERM)
+function shutdown(sig){
+  console.log(`[SHUTDOWN] ${sig} received — closing server…`);
+  server.close(()=>{ console.log("[SHUTDOWN] server closed"); process.exit(0); });
+  setTimeout(()=> process.exit(0), 8000).unref();
+}
+process.on("SIGTERM", ()=> shutdown("SIGTERM"));
+process.on("SIGINT",  ()=> shutdown("SIGINT"));
