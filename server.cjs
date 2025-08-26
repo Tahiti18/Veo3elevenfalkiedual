@@ -1,4 +1,4 @@
-// server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux + DL routes
+// server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux + DL proxy (attachment)
 // Node 18+, CommonJS
 console.log("[BOOT] starting veo3-backend-dual …");
 process.on("uncaughtException", e => console.error("[FATAL]", e));
@@ -9,6 +9,7 @@ const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { Readable } = require("stream");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -17,7 +18,8 @@ app.use(express.json({ limit: "2mb" }));
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  // include Range so proxied downloads can pass it if you ever fetch via XHR
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Range");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -107,7 +109,7 @@ function findVideoUrl(maybe) {
         if (v.data && (typeof v.data.url === "string" || typeof v.data.video_url === "string"))
           return v.data.video_url || v.data.url;
 
-        // KIE specific: data.resultUrls is often JSON string or array
+        // KIE specific: data.resultUrls often JSON string or array
         if (v.data) {
           const ru = v.data.resultUrls || v.data.resultUrl || v.data.videoUrl;
           if (typeof ru === "string") {
@@ -133,7 +135,6 @@ function findVideoUrl(maybe) {
 const cache = new Map();
 async function backgroundPollKIE(taskId) {
   if (!taskId) return;
-  // Try up to 8 polls (~60–70s)
   for (let i = 0; i < 8; i++) {
     await sleep(i === 0 ? 4000 : 8000);
     for (const pat of KIE_RESULT_PATHS) {
@@ -147,10 +148,7 @@ async function backgroundPollKIE(taskId) {
         try { jj = JSON.parse(tt); } catch { jj = { raw: tt }; }
         if (rr.ok) {
           const u = findVideoUrl(jj);
-          if (u) {
-            cache.set(taskId, u);
-            return;
-          }
+          if (u) { cache.set(taskId, u); return; }
         }
       } catch {}
     }
@@ -190,7 +188,7 @@ async function submitAndMaybeWaitFAL(body, modelName) {
 }
 
 async function submitAndMaybeWaitKIE(body, modelName) {
-  const payload = { ...body, model: modelName }; // model must be "veo3" or "veo3_fast"
+  const payload = { ...body, model: modelName };
   const submitPath = modelName === VEO_MODEL_FAST ? KIE_FAST_PATH : KIE_QUALITY_PATH;
   const submitURL = `${KIE_API_PREFIX}${submitPath.startsWith("/") ? "" : "/"}${submitPath}`;
 
@@ -200,7 +198,6 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   try { j = JSON.parse(t); } catch { j = { raw: t }; }
   if (!r.ok) return { ok: false, status: r.status, error: j?.msg || j?.error || t || `KIE submit ${r.status}`, raw: j };
 
-  // success shape: { code:200, data:{ taskId: "..." }, msg:"success" }
   const jid =
     j.taskId || j.task_id || j.id || j.job_id ||
     (j.data && (j.data.taskId || j.data.task_id || j.data.id)) ||
@@ -211,7 +208,6 @@ async function submitAndMaybeWaitKIE(body, modelName) {
   if (urlNow) return { ok: true, status: 200, job_id: jid, video_url: urlNow, raw: j };
   if (!jid) return { ok: true, status: 202, pending: true, job_id: null, raw: j };
 
-  // Kick background poll to fill cache for /result (convenience)
   backgroundPollKIE(jid).catch(()=>{});
   return { ok: true, status: 202, pending: true, job_id: jid, raw: j };
 }
@@ -300,7 +296,6 @@ app.get("/result/:jobId", async (req, res) => {
     const prov = providerFrom(req);
     const id = req.params.jobId;
 
-    // serve from cache if present
     const cached = cache.get(id);
     if (cached) return res.status(200).json({ success: true, provider: prov, job_id: id, pending: false, video_url: cached });
 
@@ -337,47 +332,41 @@ app.get("/result/:jobId", async (req, res) => {
   }
 });
 
-// ---------- DOWNLOAD ROUTES ----------
-// 1) Clean redirect by job id: GET /dl/:jobId  -> 302 to final MP4 when ready
+// ---------- DOWNLOAD (force attachment with streaming + Range) ----------
+const ALLOWED_HOSTS = new Set([
+  "r2.cloudflarestorage.com",
+  "s3.amazonaws.com",
+  "storage.googleapis.com",
+  "cdn.runwayml.com",
+  "runwayml.com",
+  "files.kie.ai",
+  "cdn.kie.ai",
+  "tempfile.aiquickdraw.com",
+  "fal.media"
+]);
+
+function isAllowedHost(u) {
+  try { return ALLOWED_HOSTS.has(new URL(u).host); } catch { return false; }
+}
+
+// 1) Resolve by job id and redirect (kept for completeness)
 app.get("/dl/:jobId", async (req, res) => {
   try {
     const id = req.params.jobId;
-
-    // 1) Try cache first
     const cached = cache.get(id);
-    if (cached) return res.redirect(302, cached);
-
-    // 2) Ask our own /result to resolve file_url
-    const base = `${req.protocol}://${req.get("host")}`;
-    const r = await fetch(`${base}/result/${encodeURIComponent(id)}?provider=${encodeURIComponent(providerFrom(req))}`);
-    const j = await r.json().catch(()=> ({}));
-
-    const file = j?.video_url || null;
+    let file = cached;
     if (!file) {
-      // Not ready vs not found: /result uses 202 for pending; treat as 409 here
-      return res.status(409).json({ error: "not_ready", id, detail: j || null });
+      const base = `${req.protocol}://${req.get("host")}`;
+      const r = await fetch(`${base}/result/${encodeURIComponent(id)}?provider=${encodeURIComponent(providerFrom(req))}`);
+      const j = await r.json().catch(()=> ({}));
+      file = j?.video_url || null;
     }
+    if (!file) return res.status(409).json({ error: "not_ready", id });
 
-    // Optional allowlist to avoid open redirects
-try {
-  const u = new URL(file);
-  const allowed = [
-    "r2.cloudflarestorage.com",
-    "s3.amazonaws.com",
-    "storage.googleapis.com",
-    "cdn.runwayml.com",
-    "runwayml.com",
-    "files.kie.ai",
-    "cdn.kie.ai",
-    "tempfile.aiquickdraw.com"   // <-- added
-  ];
-  if (!allowed.includes(u.host)) {
-        return res.status(400).json({ error: "disallowed_host", host: u.host });
-      }
-    } catch {
-      return res.status(400).json({ error: "bad_file_url" });
+    if (!isAllowedHost(file)) {
+      const host = (()=>{ try { return new URL(file).host; } catch { return "unknown"; }})();
+      return res.status(400).json({ error: "disallowed_host", host });
     }
-
     return res.redirect(302, file);
   } catch (err) {
     console.error("DL route error:", err?.message || err);
@@ -385,28 +374,62 @@ try {
   }
 });
 
-// 2) Simple passthrough: GET /dl?u=<encoded url> -> 302 to that URL (host allowlisted)
-app.get("/dl", (req, res) => {
+// 2) PROXY with attachment: GET /dl?u=<encoded url>&name=<optional>
+//    Always streams with Content-Disposition so iPad shows “Download”.
+app.get("/dl", async (req, res) => {
   try {
     const u = req.query.u;
     if (!u) return res.status(400).json({ error: "missing_u" });
-    const parsed = new URL(u);
-    const allowed = [
-      "r2.cloudflarestorage.com",
-      "s3.amazonaws.com",
-      "storage.googleapis.com",
-      "cdn.runwayml.com",
-      "runwayml.com",
-      "files.kie.ai",
-      "tempfile.aiquickdraw.com",
-      "cdn.kie.ai"
-    ];
-    if (!allowed.includes(parsed.host)) {
-      return res.status(400).json({ error: "disallowed_host", host: parsed.host });
+    if (!isAllowedHost(u)) {
+      const host = (()=>{ try { return new URL(u).host; } catch { return "bad_url"; }})();
+      return res.status(400).json({ error: "disallowed_host", host });
     }
-    return res.redirect(302, u);
-  } catch {
-    return res.status(400).json({ error: "bad_url" });
+
+    const attName = String(req.query.name || `video_${Date.now()}.mp4`).replace(/[^a-z0-9_\-\.]/gi, "_");
+
+    // Pass Range when present (useful for resumable downloads)
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    const upstream = await fetch(u, { headers });
+    if (!upstream.ok && upstream.status !== 206) {
+      const txt = await upstream.text().catch(()=> "");
+      return res.status(upstream.status || 502).json({ error: "upstream_error", detail: txt.slice(0, 500) });
+    }
+
+    // Mirror status (200 or 206) and content headers
+    const ct = upstream.headers.get("content-type") || "video/mp4";
+    const cl = upstream.headers.get("content-length");
+    const cr = upstream.headers.get("content-range");
+    const ar = upstream.headers.get("accept-ranges");
+
+    res.status(upstream.status);
+    res.setHeader("Content-Type", ct);
+    if (cl) res.setHeader("Content-Length", cl);
+    if (cr) res.setHeader("Content-Range", cr);
+    if (ar) res.setHeader("Accept-Ranges", ar);
+    res.setHeader("Content-Disposition", `attachment; filename="${attName}"`);
+
+    // Pipe web stream -> Node response
+    const body = upstream.body;
+    if (body && body.getReader) {
+      const reader = body.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      res.end();
+    } else if (body && typeof body.pipe === "function") {
+      // (Undici sometimes gives a Node stream)
+      body.pipe(res);
+    } else {
+      // Fallback: buffer then send (small files)
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.end(buf);
+    }
+  } catch (e) {
+    return res.status(400).json({ error: "bad_url_or_network", detail: e?.message || String(e) });
   }
 });
 
