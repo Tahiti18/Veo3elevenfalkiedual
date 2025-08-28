@@ -1,4 +1,4 @@
-// server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux + DL proxy (attachment)
+// server.cjs — Dual-provider backend (KIE + FAL) + ElevenLabs + optional mux + DL proxy (attachment) + Image upload
 // Node 18+, CommonJS
 console.log("[BOOT] starting veo3-backend-dual …");
 process.on("uncaughtException", e => console.error("[FATAL]", e));
@@ -9,10 +9,10 @@ const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
-const { Readable } = require("stream");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+// bump limit so base64 images are accepted
+app.use(express.json({ limit: "25mb" }));
 
 // ---- CORS (explicit preflight 204) ----
 app.use((req, res, next) => {
@@ -69,10 +69,12 @@ const TMP_ROOT = "/tmp";
 const STATIC_ROOT = path.join(TMP_ROOT, "public");
 const TTS_DIR = path.join(STATIC_ROOT, "tts");
 const MUX_DIR = path.join(STATIC_ROOT, "mux");
+const IMG_DIR = path.join(STATIC_ROOT, "img"); // <--- new (for uploaded images)
 (async () => {
   try {
     await fs.mkdir(TTS_DIR, { recursive: true });
     await fs.mkdir(MUX_DIR, { recursive: true });
+    await fs.mkdir(IMG_DIR, { recursive: true }); // <--- ensure exists
   } catch {}
 })();
 
@@ -421,10 +423,8 @@ app.get("/dl", async (req, res) => {
       }
       res.end();
     } else if (body && typeof body.pipe === "function") {
-      // (Undici sometimes gives a Node stream)
       body.pipe(res);
     } else {
-      // Fallback: buffer then send (small files)
       const buf = Buffer.from(await upstream.arrayBuffer());
       res.end(buf);
     }
@@ -433,10 +433,47 @@ app.get("/dl", async (req, res) => {
   }
 });
 
+// ---------- IMAGE UPLOAD (base64 data URL -> /static/img/...) ----------
+app.post("/upload-image", async (req, res) => {
+  try {
+    const { data_url, filename } = req.body || {};
+    if (!data_url || typeof data_url !== "string" || !data_url.startsWith("data:")) {
+      return res.status(400).json({ error: "missing_or_invalid_data_url" });
+    }
+
+    // parse data URL: data:image/png;base64,AAAA...
+    const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/i.exec(data_url);
+    if (!m) return res.status(400).json({ error: "unsupported_data_url" });
+
+    const mime = m[1].toLowerCase();
+    const b64 = m[2];
+    const buf = Buffer.from(b64, "base64");
+
+    // decide extension
+    let ext = ".png";
+    if (mime.includes("jpeg") || mime.includes("jpg")) ext = ".jpg";
+    else if (mime.includes("webp")) ext = ".webp";
+    else if (mime.includes("png")) ext = ".png";
+
+    const cleanBase = (filename && String(filename).trim().replace(/[^a-z0-9_\-\.]/gi, "_").replace(/\.+$/, "")) || `img_${Date.now()}`;
+    const safe = cleanBase.endsWith(ext) ? cleanBase : `${cleanBase}${ext}`;
+
+    const outPath = path.join(IMG_DIR, safe);
+    await fs.writeFile(outPath, buf);
+
+    // public URL
+    const image_url = `/static/img/${safe}`;
+    return res.json({ image_url, bytes: buf.length, mime });
+  } catch (e) {
+    return res.status(500).json({ error: "upload_failed", detail: e?.message || String(e) });
+  }
+});
+
 // --- /api/* aliases so frontends calling /api/... also work ---
 app.get("/api/result/:jobId", (req,res,next)=>{ req.url=`/result/${req.params.jobId}`; app._router.handle(req,res,next); });
 app.get("/api/dl/:jobId", (req,res,next)=>{ req.url=`/dl/${req.params.jobId}`; app._router.handle(req,res,next); });
 app.get("/api/dl", (req,res,next)=>{ req.url="/dl"; app._router.handle(req,res,next); });
+app.post("/api/upload-image", (req,res,next)=>{ req.url="/upload-image"; app._router.handle(req,res,next); });
 
 // ---------- ElevenLabs ----------
 app.get("/eleven/voices", async (_req, res) => {
